@@ -1,0 +1,8 @@
+opencv-python>=4.8.0
+mediapipe>=0.10.0
+PyQt5>=5.15.0
+pyqtgraph>=0.13.0
+pyinstaller>=6.0.0
+numpy>=1.24.0
+Pillow>=10.0.0
+winotify>=1.1.0

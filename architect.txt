@@ -1,0 +1,82 @@
+# 📌 Project Specification: Python-based Posture Monitor Desktop App
+
+## 1. Project Overview
+- **Goal**: Build a desktop application (.exe) that analyzes posture in real time using a webcam, detects Forward Head Posture (turtle neck) and shoulder imbalance, logs data locally, and visualizes posture history on a dashboard.
+- **Tech Stack**: Python 3.x, OpenCV, MediaPipe, PyQt5, PyQtGraph (or Matplotlib), SQLite3, PyInstaller
+- **Architecture Pattern**: Modularized 4-Layer Structure (GUI / AI Engine / Logic / Database)
+
+---
+
+## 2. Directory & File Structure
+
+my_posture_app/
+├── main.py              # [Layer 1] PyQt5 GUI main window & Dashboard layout
+├── camera_worker.py     # [Layer 2] OpenCV video capture & MediaPipe pose landmark extraction thread
+├── posture_logic.py     # [Layer 3] Trigonometric & slope algorithms for posture evaluation
+├── db_manager.py        # [Layer 4] Local SQLite database manager & aggregation queries
+├── requirements.txt     # Dependency specifications
+└── README.md            # Project documentation
+
+---
+
+## 3. Module Specifications
+
+### Module 1: posture_logic.py (Core Algorithm / Pure Functions)
+- **Role**: Pure mathematical evaluation without direct dependency on OpenCV or UI.
+- **Key Functions**:
+  - `calculate_angle(p1, p2)`: Calculates angle theta in degrees using arctan2(dy, dx).
+  - `check_turtle_neck(ear_point, shoulder_point, threshold=60.0)`: Evaluates whether ear-to-shoulder angle drops below the threshold.
+  - `check_shoulder_imbalance(left_shoulder, right_shoulder, threshold=0.05)`: Evaluates absolute difference in y-coordinates of left and right shoulders.
+
+### Module 2: camera_worker.py (Video Ingestion & Landmark Extraction)
+- **Role**: Multithreaded worker (QThread) handling camera frames.
+- **Key Responsibilities**:
+  - Capture frame-by-frame via cv2.VideoCapture(0).
+  - Process frames with mediapipe.solutions.pose.
+  - Extract 3D normalized coordinates for key landmarks (Ears: #7, #8 / Shoulders: #11, #12).
+  - Pass coordinate dicts to posture_logic.py.
+  - Emit processed image frame and analysis results to the main GUI via Qt Signals.
+
+### Module 3: db_manager.py (Local Storage & Statistics)
+- **Role**: Manages local SQLite database operations.
+- **Schema**:
+  - Table: posture_logs
+  - Columns: id (INTEGER PRIMARY KEY), timestamp (DATETIME), is_turtle (BOOLEAN), is_imbalanced (BOOLEAN), neck_angle (REAL)
+- **Key Methods**:
+  - `init_db()`: Initializes table structure.
+  - `log_status(is_turtle, is_imbalanced, neck_angle)`: Inserts a record (throttled to 1-second intervals or state changes).
+  - `get_daily_summary(date_str)`: Fetches aggregated counts and hourly posture scores for dashboard charts.
+
+### Module 4: main.py (PyQt5 GUI & Dashboard)
+- **Role**: Entry point for application layout and event loops.
+- **UI Components**:
+  - Left Panel: Live webcam feed with MediaPipe skeleton overlay + real-time warning indicators.
+  - Right Panel: Dashboard showing daily posture score, turtle neck alert count, and hourly distribution chart via pyqtgraph.
+
+---
+
+## 4. Dependencies (requirements.txt)
+
+opencv-python>=4.8.0
+mediapipe>=0.10.0
+PyQt5>=5.15.0
+pyqtgraph>=0.13.0
+pyinstaller>=6.0.0
+
+---
+
+## 5. Build & Packaging (.exe)
+
+Execute the following command in the project root directory to convert the application into a standalone executable:
+
+pyinstaller -w -F main.py
+
+---
+
+## 6. Instructions for AI Code Generator
+
+When generating code based on this specification, please adhere to the following rules:
+1. Keep posture_logic.py strictly decoupled from PyQt5 and OpenCV so it can be tested independently.
+2. Use Qt Threads (QThread / pyqtSignal) for camera_worker.py to prevent freezing the main GUI thread during frame processing.
+3. Include clear inline comments explaining coordinate transformations and mathematical calculations.
+4. Provide code iteratively starting with posture_logic.py and camera_worker.py.
