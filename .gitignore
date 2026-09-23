@@ -8,3 +8,5 @@ build/
 *.spec
 .vscode/
 .idea/
+baseline.json
+recordings/
