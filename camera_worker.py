@@ -40,11 +40,10 @@ BASELINE_VERSION = 2  # 저장하는 기준값의 계산식이 바뀌면 올린�
 TARGET_BRIGHTNESS = 110        # 보정 목표 평균 밝기
 MIN_GAMMA = 0.25               # 너무 어두운 화면을 과하게 펴면 노이즈만 커지므로 보정 한도
 
-CALIB_COUNTDOWN_SECONDS = 3.0  # 버튼을 누른 뒤 바른 자세를 잡을 준비 시간
-# 이 시간 동안 판정과 같은 평활을 거친 값을 모아, 중앙값으로 기준을 잡고 흔들림 폭으로 자동 임계를 정한다.
-# (카운트다운 동안 평활을 미리 돌려 두므로 측정 시작 시점엔 평활값이 안정돼 있다.)
-# 흔들림은 1초 단위로 천천히 출렁이므로 너무 짧게 재면 과소평가된다.
-CALIB_SAMPLE_SECONDS = 3.0
+# 버튼을 누른 뒤 바른 자세를 잡을 준비 시간. 마우스로 버튼을 누르느라 기운 자세가 기준에 섞이지 않게 넉넉히 둔다.
+# 측정은 판정과 같은 평활을 거친 값으로 하며(카운트다운 동안 평활을 미리 돌려 둠), 가만히 있던 구간을
+# posture_tracker.CalibrationCollector가 골라 기준과 자동 임계를 정한다.
+CALIB_COUNTDOWN_SECONDS = 5.0
 NOTICE_SECONDS = 3.0           # 캘리브레이션 결과 문구를 영상 위에 띄워두는 시간
 TIME_FLUSH_SECONDS = 10.0      # 판정 시간 집계를 DB에 쓰는 주기 (비정상 종료 시 이만큼만 잃음)
 
@@ -130,7 +129,7 @@ class CameraWorker(QThread):
         # 캘리브레이션은 GUI 스레드에서 요청만 하고, 실제 측정/기준값 갱신은 워커 스레드에서 한다.
         self._calib_requested = False
         self._calib_started_at = None
-        self._calib_samples = []
+        self._calib_collector = None  # 측정 구간에 들어가면 CalibrationCollector
         self._notice = None  # (문구, 색, 만료 시각)
         self._hold_reason = None
 
@@ -193,17 +192,13 @@ class CameraWorker(QThread):
     def _calib_phase(self, now):
         if self._calib_started_at is None:
             return None
-        elapsed = now - self._calib_started_at
-        if elapsed < CALIB_COUNTDOWN_SECONDS:
+        if now - self._calib_started_at < CALIB_COUNTDOWN_SECONDS:
             return "countdown"
-        if elapsed < CALIB_COUNTDOWN_SECONDS + CALIB_SAMPLE_SECONDS:
-            return "sampling"
-        return "done"
+        return "sampling"
 
-    def _finish_calibration(self, now):
-        samples = self._calib_samples
+    def _finish_calibration(self, now, stable, samples):
         self._calib_started_at = None
-        self._calib_samples = []
+        self._calib_collector = None
 
         calib = posture_logic.baseline_from_samples(samples)
         if calib is None:
@@ -219,6 +214,8 @@ class CameraWorker(QThread):
             self._recorder.write_baseline(now, self.tracker.baseline, self.tracker.thresholds)
 
         msg = "기준 자세가 설정되었습니다"
+        if not stable:
+            msg += " (측정 중 자세가 계속 흔들려 가장 안정된 구간으로 잡았습니다)"
         if "turtle" in calib["missing"]:
             msg += " (귀가 잘 보이지 않아 거북목은 판정하지 않습니다)"
         color = COLOR_NORMAL
@@ -346,7 +343,7 @@ class CameraWorker(QThread):
                 if self._calib_requested:
                     self._calib_requested = False
                     self._calib_started_at = now
-                    self._calib_samples = []
+                    self._calib_collector = None
                     # 측정 중에는 판정하지 않으므로 진행 중인 이상 자세는 여기서 끝낸다.
                     # 이전 자세의 평활값이 새 기준에 섞이지 않도록 평활도 처음부터 다시 시작.
                     self._handle_events(self.tracker.end_all(now))
@@ -371,7 +368,9 @@ class CameraWorker(QThread):
                         # 값을 모은다. 원값으로 흔들림을 재면 평활 후보다 훨씬 커서 자동 임계가 과하게 넓어진다.
                         sm = self.tracker.smoother.update(m, now)
                         if calib_phase == "sampling":
-                            self._calib_samples.append(posture_tracker.calibration_sample(sm))
+                            if self._calib_collector is None:
+                                self._calib_collector = posture_tracker.CalibrationCollector(now)
+                            self._calib_collector.add(now, posture_tracker.calibration_sample(sm))
                 else:
                     tracked = self.tracker.process(now, m, brightness)
                     self._handle_events(tracked["events"], tracked["notify"])
@@ -401,15 +400,26 @@ class CameraWorker(QThread):
                         landmark_drawing_spec=style, connection_drawing_spec=style,
                     )
 
-                if calib_phase == "done":
-                    self._finish_calibration(now)
-                    calib_phase = None
+                if calib_phase == "sampling":
+                    if self._calib_collector is None:
+                        # 사람이 안 보여 첫 샘플이 없어도 제한 시간은 흐르도록 측정 시작 시각을 잡아 둔다
+                        self._calib_collector = posture_tracker.CalibrationCollector(now)
+                    finished = self._calib_collector.poll(now)
+                    if finished is not None:
+                        self._finish_calibration(now, *finished)
+                        calib_phase = None
 
                 if calib_phase == "countdown":
                     remaining = math.ceil(CALIB_COUNTDOWN_SECONDS - (now - self._calib_started_at))
                     image = _put_text_kr(image, f"바른 자세로 앉아주세요... {remaining}", (10, 8), 26, COLOR_INFO)
                 elif calib_phase == "sampling":
-                    image = _put_text_kr(image, "기준 자세 측정 중... 움직이지 마세요", (10, 8), 26, COLOR_INFO)
+                    measured = now - self._calib_collector.start
+                    if measured < posture_tracker.CALIB_WINDOW_SECONDS:
+                        remaining = math.ceil(posture_tracker.CALIB_WINDOW_SECONDS - measured)
+                        text = f"기준 자세 측정 중... 움직이지 마세요 {remaining}"
+                    else:
+                        text = "자세가 흔들려 조금 더 측정합니다... 움직이지 마세요"
+                    image = _put_text_kr(image, text, (10, 8), 26, COLOR_INFO)
                 elif not self.has_baseline:
                     guide_text = "바른 자세로 앉은 뒤 '기준 자세 설정' 버튼을 누르세요"
                     image = _put_text_kr(image, guide_text, (10, 8), 26, COLOR_NORMAL)

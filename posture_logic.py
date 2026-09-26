@@ -29,6 +29,10 @@ MAX_SHOULDER_GROW_RATIO = 1.30
 MAX_SHOULDER_TILT_THRESHOLD = 0.12
 
 CALIB_MIN_SAMPLES = 20  # 기준 자세 측정에서 유효 샘플이 이보다 적으면 실패로 처리
+# 기준 자세 측정 구간이 "가만히 있었다"고 볼 수 있는 흔들림 한도. 퍼짐은 상하위 5%를 뺀 폭(p95−p5)이다.
+# 자세를 잡는 도중(예: 버튼을 누르느라 앞으로 기울었다가 바로 앉는 중)이 섞이면 목 길이비가 수~10% 움직여 걸러진다.
+CALIB_STABLE_SPREAD = 0.04       # 목 길이비·어깨너비: 중앙값 대비 퍼짐
+CALIB_STABLE_TILT_SPREAD = 0.02  # 어깨 기울기: 절대 퍼짐
 
 
 def default_thresholds():
@@ -165,6 +169,24 @@ def auto_thresholds(necks, widths, tilts):
 
     result["capped"] = capped
     return result
+
+
+def calibration_spread(samples):
+    """
+    기준 자세 측정 구간의 흔들림 점수. 지표마다 퍼짐(p95−p5)을 허용치로 나눈 값 중 가장 큰 것이라
+    1 이하면 "가만히 있었다"고 본다. 목 길이비는 귀가 절반 이상 보였을 때만 따진다.
+    """
+    def spread(values):
+        lo, hi = np.percentile(values, [5, 95])
+        return float(hi - lo)
+
+    widths = [s["width"] for s in samples]
+    parts = [spread(widths) / float(np.median(widths)) / CALIB_STABLE_SPREAD,
+             spread([s["tilt"] for s in samples]) / CALIB_STABLE_TILT_SPREAD]
+    necks = [s["neck"] for s in samples if s.get("neck") is not None]
+    if necks and len(necks) >= len(samples) / 2:
+        parts.append(spread(necks) / float(np.median(necks)) / CALIB_STABLE_SPREAD)
+    return max(parts)
 
 
 def baseline_from_samples(samples):

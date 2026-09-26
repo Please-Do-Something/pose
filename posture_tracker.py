@@ -21,6 +21,10 @@ MIN_BRIGHTNESS = 3             # 화면 평균 밝기(0~255)가 이보다 낮으
 SMOOTH_TAU = {"l_sh": 1.0, "r_sh": 1.0, "l_ear": 0.5, "r_ear": 0.5}
 MEDIAN_WINDOW = 5              # 평활 전에 최근 N프레임 중앙값을 취해 한 프레임짜리 튐을 제거
 
+# ---- 기준 자세 측정 ----
+CALIB_WINDOW_SECONDS = 8.0     # 이만큼 가만히 있던 구간의 중앙값으로 기준을 잡는다 (흔들림 추정도 이 구간으로)
+CALIB_MAX_SECONDS = 20.0       # 안정된 구간이 안 나와도 여기서 끝내고 가장 안정됐던 구간을 쓴다
+
 # ---- 확정/복귀 ----
 # 이상 자세가 "확정"되려면 최근 이 시간 동안의 프레임 중 CONFIRM_FRACTION 이상이 임계를 넘어야 한다.
 SUSTAIN_SECONDS = {"turtle": 2.0, "lean": 2.0, "tilt": 2.0}
@@ -112,6 +116,38 @@ def calibration_sample(sm):
     )
     return {"width": result["shoulder_width"], "tilt": result["tilt_ratio"],
             "neck": result["neck_ratio"]}
+
+
+class CalibrationCollector:
+    """
+    기준 자세 측정 샘플을 모으고, 가만히 있던 구간을 골라 준다.
+    측정을 시작한 뒤 CALIB_WINDOW_SECONDS가 지나면 매 프레임 "최근 CALIB_WINDOW_SECONDS" 구간의 흔들림을 보고,
+    충분히 안정되면 그 구간으로 끝낸다. 흔들리면 CALIB_MAX_SECONDS까지 계속 재고, 그래도 안 되면
+    그동안 가장 안정됐던 구간을 쓴다. 실패로 끝내지 않아 사용자가 버튼을 다시 누를 필요가 없다.
+    (예전: 고정 3초 측정 → 같은 자리에서도 기준 목 길이비가 1.33~1.51로 최대 13% 흔들림.
+     버튼을 누르느라 기운 자세가 섞였고, 3초로는 느린 출렁임도 잴 수 없었다)
+    """
+
+    def __init__(self, start):
+        self.start = start
+        self._samples = []  # (시각, calibration_sample)
+        self._best = None   # (흔들림 점수, 샘플 목록)
+
+    def add(self, t, sample):
+        self._samples.append((t, sample))
+
+    def poll(self, t):
+        """측정을 끝낼 때면 (안정 구간을 찾았는지, 기준에 쓸 샘플 목록), 아직이면 None."""
+        window = [s for ts, s in self._samples if ts >= t - CALIB_WINDOW_SECONDS]
+        if t - self.start >= CALIB_WINDOW_SECONDS and len(window) >= posture_logic.CALIB_MIN_SAMPLES:
+            spread = posture_logic.calibration_spread(window)
+            if self._best is None or spread < self._best[0]:
+                self._best = (spread, window)
+            if spread <= 1.0:
+                return True, window
+        if t - self.start >= CALIB_MAX_SECONDS:
+            return False, self._best[1] if self._best else window
+        return None
 
 
 class IssueState:

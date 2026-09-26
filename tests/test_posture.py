@@ -1,5 +1,6 @@
 # 합성 랜드마크로 판정 로직을 검증한다.  실행: python -m unittest discover tests
 import io
+import math
 import os
 import sys
 import tempfile
@@ -83,6 +84,62 @@ class MetricTests(unittest.TestCase):
         self.assertEqual(merged["neck_drop"], 0.2)                               # 자동으로 넓어진 값은 유지
         self.assertEqual(merged["shoulder_grow"], posture_logic.SHOULDER_GROW_RATIO)  # 없던 항목은 기본값
         self.assertNotIn("nod", merged)                                          # 없어진 항목은 무시
+
+
+def collect(samples_fn, seconds, start=100.0):
+    """t초의 샘플을 돌려주는 samples_fn(None이면 사람 없음)으로 수집기를 돌려 (끝난 시각, 안정 여부, 샘플)."""
+    c = pt.CalibrationCollector(start)
+    for i in range(int(seconds * FPS)):
+        t = start + i / FPS
+        sample = samples_fn(i / FPS)
+        if sample is not None:
+            c.add(t, sample)
+        finished = c.poll(t)
+        if finished is not None:
+            return (t - start, *finished)
+    return None
+
+
+def calib_sample(neck, width=200.0, tilt=0.0):
+    return {"neck": neck, "width": width, "tilt": tilt}
+
+
+class CalibrationTests(unittest.TestCase):
+    def test_still_posture_finishes_after_window(self):
+        wobble = lambda s: 0.005 * math.sin(s * 7)  # noqa: E731  (평활 후에도 남는 작은 떨림)
+        elapsed, stable, samples = collect(lambda s: calib_sample(1.45 + wobble(s)), 30)
+        self.assertTrue(stable)
+        self.assertAlmostEqual(elapsed, pt.CALIB_WINDOW_SECONDS, delta=0.1)
+        self.assertAlmostEqual(posture_logic.baseline_from_samples(samples)["baseline"]["neck"], 1.45, delta=0.01)
+
+    def test_settling_posture_is_left_out(self):
+        # 버튼을 누르느라 앞으로 기운 자세(1.33)로 3초 → 바로 앉음(1.45). 예전 고정 3초 측정이면 1.33이 기준이 됐다.
+        elapsed, stable, samples = collect(lambda s: calib_sample(1.33 if s < 3 else 1.45), 30)
+        self.assertTrue(stable)
+        self.assertGreater(elapsed, 3 + pt.CALIB_WINDOW_SECONDS - 0.5)
+        self.assertAlmostEqual(posture_logic.baseline_from_samples(samples)["baseline"]["neck"], 1.45, delta=0.001)
+
+    def test_restless_posture_uses_most_stable_window_at_timeout(self):
+        # 계속 크게 움직이다가 중간 10초만 덜 움직임(그래도 안정 기준은 넘음) → 제한 시간에 끝나고, 그 구간을 쓴다
+        def restless(s):
+            if 5 <= s < 15:
+                return calib_sample(1.45 + 0.04 * math.sin(s * 3))
+            return calib_sample(1.45 + 0.15 * math.sin(s * 3))
+        elapsed, stable, samples = collect(restless, 30)
+        self.assertFalse(stable)
+        self.assertAlmostEqual(elapsed, pt.CALIB_MAX_SECONDS, delta=0.1)
+        self.assertLess(posture_logic.calibration_spread(samples), posture_logic.calibration_spread(
+            [calib_sample(1.45 + 0.15 * math.sin(i / FPS * 3)) for i in range(int(8 * FPS))]))
+
+    def test_nobody_in_view_ends_without_samples(self):
+        elapsed, stable, samples = collect(lambda s: None, 30)
+        self.assertAlmostEqual(elapsed, pt.CALIB_MAX_SECONDS, delta=0.1)
+        self.assertEqual(samples, [])
+        self.assertIsNone(posture_logic.baseline_from_samples(samples))  # 워커는 실패 안내를 띄운다
+
+    def test_spread_ignores_neck_when_ears_mostly_hidden(self):
+        samples = [calib_sample(None if i % 3 else 1.0 + i) for i in range(60)]
+        self.assertLess(posture_logic.calibration_spread(samples), 1.0)
 
 
 class IssueStateTests(unittest.TestCase):
