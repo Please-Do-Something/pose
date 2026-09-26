@@ -170,6 +170,9 @@ class CameraWorker(QThread):
                                 COLOR_INFO, time.time() + NOTICE_SECONDS + 2)
                 return False
             baseline = {"width": float(data["width"]), "tilt": float(data["tilt"]), "neck": data.get("neck")}
+            if data.get("neck_calibrated") is not None:
+                # 앉은 거리 변화로 거북목 기준이 옮겨진 상태 (누적 이동 한도의 기준점)
+                baseline["neck_calibrated"] = float(data["neck_calibrated"])
             # 예전 파일에 없거나 현재 기본값보다 좁은 임계는 기본값을 쓴다 (없어진 항목의 값은 무시)
             thresholds = posture_logic.merge_thresholds(data.get("thresholds"))
         except (OSError, ValueError, KeyError, TypeError, AttributeError):
@@ -291,8 +294,15 @@ class CameraWorker(QThread):
             lines.append(f"목 길이비: {ev['neck_ratio']:.3f} | 기준 없음")
         else:
             drop = 1 - ev["neck_ratio"] / b["neck"]
-            lines.append(f"목 길이비: {ev['neck_ratio']:.3f} | 기준 {b['neck']:.3f} → 감소 {drop * 100:+.0f}% "
-                         f"(임계 {th['neck_drop'] * 100:.0f}%{auto_tag('neck_drop')}){state_tag('turtle')}")
+            seat = ""
+            if b.get("neck_calibrated"):
+                # 앉은 거리 변화로 옮긴 기준을 처음 잡은 기준과 비교해 표시
+                seat = f" (거리 보정 {(b['neck'] / b['neck_calibrated'] - 1) * 100:+.0f}%)"
+            if t.seat_moving:
+                lines.append(f"목 길이비: {ev['neck_ratio']:.3f} | 앉은 거리 변화 감지 → 거북목 판정 잠시 멈춤")
+            else:
+                lines.append(f"목 길이비: {ev['neck_ratio']:.3f} | 기준 {b['neck']:.3f}{seat} → 감소 {drop * 100:+.0f}% "
+                             f"(임계 {th['neck_drop'] * 100:.0f}%{auto_tag('neck_drop')}){state_tag('turtle')}")
 
         width = ev["shoulder_width"]
         if b:
@@ -366,6 +376,12 @@ class CameraWorker(QThread):
                     tracked = self.tracker.process(now, m, brightness)
                     self._handle_events(tracked["events"], tracked["notify"])
                     self._hold_reason = tracked["hold_shown"]
+                    if tracked["seat_shift"]:
+                        # 자리를 옮긴 만큼 거북목 기준이 자동으로 옮겨졌다. 재실행해도 이어지도록 저장한다.
+                        # (녹화에는 기준 줄을 쓰지 않는다: 재생 때 트래커가 같은 보정을 스스로 다시 한다)
+                        self._save_baseline()
+                        self._notice = ("앉은 거리가 바뀌어 거북목 기준을 자동으로 맞췄습니다",
+                                        COLOR_INFO, now + NOTICE_SECONDS)
                 self._flush_time(now)
 
                 confirmed = self.tracker.confirmed_issues()

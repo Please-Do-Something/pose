@@ -60,6 +60,7 @@ def replay(records, baseline_override=None, threshold_overrides=None):
             "eval": res["eval"],
             "confirmed": set(tracker.confirmed_issues()),
             "notify": res["notify"],
+            "seat_shift": res["seat_shift"],
         })
     if frames:
         events += tracker.end_all(frames[-1]["t"])
@@ -87,6 +88,10 @@ def summarize(frames, events, out=sys.stdout):
     for issue in ISSUES:
         secs = _confirmed_seconds(frames, issue)
         p(f"  {ISSUE_LABELS[issue]:<16} 확정 {starts[issue]}회, {secs:.0f}초, 알림 {notifies[issue]}회")
+    shifts = [f["seat_shift"]["shift"] for f in frames if f["seat_shift"]]
+    if shifts:
+        p(f"  앉은 거리 변화로 거북목 기준 자동 이동 {len(shifts)}회: "
+          + ", ".join(f"{v * 100:+.0f}%" for v in shifts))
 
     by_label = defaultdict(list)
     for f in judged:

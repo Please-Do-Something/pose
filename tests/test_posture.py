@@ -151,13 +151,23 @@ class TrackerTests(unittest.TestCase):
     def test_issues_have_independent_timers(self):
         tr = calibrated_tracker()
         t, _, _ = run(tr, UPRIGHT, 0.0, 5)
-        # 거북목 → 거북목+기울어짐 → 기울어짐. 어느 한 항목이라도 임계를 넘은 구간은 약 2.2초 이어지지만
-        # (예전의 정상/이상 단일 상태였다면 확정), 항목별로는 각각 약 1.3초라 확정되면 안 된다.
+        # 거북목 → 거북목+기울어짐 → 기울어짐. 어느 한 항목이라도 임계를 넘은 구간은 2초가 넘게 이어지지만
+        # (예전의 정상/이상 단일 상태였다면 확정), 항목별로는 각각 1.6초 미만이라 확정되면 안 된다.
         both = pose(ear_y=265, ear_half=33, tilt_dy=14)
-        ev = []
+        ev, any_run, longest_any, above = [], 0.0, 0.0, {i: 0.0 for i in posture_logic.ISSUES}
         for points, secs in ((TURTLE, 1.1), (both, 1.0), (TILT, 1.0)):
-            t, e, _ = run(tr, points, t, secs)
-            ev += e
+            for _ in range(int(round(secs * FPS))):
+                res = tr.process(t, pt.measurement_from_points(points), 100)
+                t += 1 / FPS
+                ev += res["events"]
+                over = [i for i, s in res["eval"]["scores"].items() if (s or 0) >= 1]
+                any_run = any_run + 1 / FPS if over else 0.0
+                longest_any = max(longest_any, any_run)
+                for i in over:
+                    above[i] += 1 / FPS
+        # 임계값이나 지표를 바꾸면 자세별 점수가 달라져 이 전제가 깨질 수 있으므로 함께 확인한다
+        self.assertGreater(longest_any, 2.1)
+        self.assertLess(max(above.values()), 1.6)
         self.assertEqual(ev, [])
         self.assertEqual(tr.confirmed_issues(), [])
 
@@ -183,6 +193,87 @@ class TrackerTests(unittest.TestCase):
         _, ev, _ = run(tr, TURTLE, 0.0, 5)
         self.assertEqual(ev, [])
         self.assertEqual(tr.pop_time(), {})
+
+
+# 앉은 거리 변화 자동 보정용 자세. 원근 때문에 가까이 앉으면 바른 자세여도 목 길이비가 줄어드는 상황을 흉내 낸다.
+CLOSE = pose(ear_y=248, ear_half=37, sh_half=120)          # 바른 자세로 당겨 앉음: 어깨너비 +20%, 목 길이비 -18%
+CLOSE_TURTLE = pose(ear_y=268, ear_half=40, sh_half=120)   # 당겨 앉은 자리에서 거북목
+SLOUCH = pose(ear_y=268, ear_half=33, sh_half=107)         # 빠르게 상체를 숙임: 어깨너비 +7%, 목 길이비 크게 감소
+
+
+def run_steps(tracker, steps, t0=0.0):
+    """[(시작 자세, 끝 자세, 초)] 순서로, 두 자세 사이를 선형으로 옮겨 가며 넣는다. (시각, 이벤트, 기준 이동 목록)."""
+    events, shifts, t = [], [], t0
+    for a, b, secs in steps:
+        n = int(round(secs * FPS))
+        for i in range(n):
+            f = (i + 1) / n
+            points = {k: [a[k][j] + (b[k][j] - a[k][j]) * f for j in range(3)] for k in a}
+            res = tracker.process(t, pt.measurement_from_points(points), 100)
+            events += [(e["type"], e["issue"]) for e in res["events"]]
+            if res["seat_shift"]:
+                shifts.append(res["seat_shift"])
+            t += 1 / FPS
+    return t, events, shifts
+
+
+class SeatMoveTests(unittest.TestCase):
+    def test_pulling_chair_in_shifts_baseline_instead_of_turtle(self):
+        tr = calibrated_tracker()
+        _, events, shifts = run_steps(tr, [(UPRIGHT, UPRIGHT, 5), (UPRIGHT, CLOSE, 1.0), (CLOSE, CLOSE, 12)])
+        self.assertNotIn(("start", "turtle"), events)
+        self.assertIn(("start", "lean"), events)  # 가까이 앉은 것 자체는 모니터 근접으로 잡혀야 한다
+        self.assertEqual(len(shifts), 1)
+        self.assertAlmostEqual(shifts[0]["shift"], -0.18, delta=0.02)
+        self.assertAlmostEqual(tr.baseline["neck_calibrated"], 2.5)
+
+    def test_same_move_without_compensation_is_false_turtle(self):
+        # 보정이 없으면(예전 동작) 같은 동작이 거북목으로 오판된다 — 위 테스트가 의미 있는지 확인
+        tr = calibrated_tracker()
+        original = pt.SEAT_MOVE_WIDTH_CHANGE
+        pt.SEAT_MOVE_WIDTH_CHANGE = 99
+        try:
+            _, events, _ = run_steps(tr, [(UPRIGHT, UPRIGHT, 5), (UPRIGHT, CLOSE, 1.0), (CLOSE, CLOSE, 12)])
+        finally:
+            pt.SEAT_MOVE_WIDTH_CHANGE = original
+        self.assertIn(("start", "turtle"), events)
+
+    def test_turtle_after_moving_is_still_detected(self):
+        tr = calibrated_tracker()
+        _, events, _ = run_steps(tr, [(UPRIGHT, UPRIGHT, 5), (UPRIGHT, CLOSE, 1.0), (CLOSE, CLOSE, 12),
+                                      (CLOSE, CLOSE_TURTLE, 0.5), (CLOSE_TURTLE, CLOSE_TURTLE, 5)])
+        self.assertIn(("start", "turtle"), events)
+
+    def test_quick_slouch_is_not_a_seat_move(self):
+        tr = calibrated_tracker()
+        _, events, shifts = run_steps(tr, [(UPRIGHT, UPRIGHT, 5), (UPRIGHT, SLOUCH, 1.0), (SLOUCH, SLOUCH, 6)])
+        self.assertEqual(shifts, [])
+        self.assertIn(("start", "turtle"), events)
+
+    def test_no_shift_when_already_turtle_before_moving(self):
+        tr = calibrated_tracker()
+        _, events, shifts = run_steps(tr, [(TURTLE, TURTLE, 5), (TURTLE, CLOSE_TURTLE, 1.0),
+                                           (CLOSE_TURTLE, CLOSE_TURTLE, 12)])
+        self.assertEqual(shifts, [])
+        self.assertIn(("start", "turtle"), events)
+        self.assertNotIn(("end", "turtle"), events)
+
+    def test_shift_beyond_limit_is_rejected(self):
+        # 당기면서 자세도 크게 무너지면(목 길이비 변화가 한도 초과) 기준을 옮기지 않고 거북목으로 본다
+        collapsed = pose(ear_y=285, ear_half=37, sh_half=120)
+        tr = calibrated_tracker()
+        _, events, shifts = run_steps(tr, [(UPRIGHT, UPRIGHT, 5), (UPRIGHT, collapsed, 1.0), (collapsed, collapsed, 12)])
+        self.assertEqual(shifts, [])
+        self.assertIn(("start", "turtle"), events)
+
+    def test_recalibration_clears_seat_shift(self):
+        tr = calibrated_tracker()
+        run_steps(tr, [(UPRIGHT, UPRIGHT, 5), (UPRIGHT, CLOSE, 1.0), (CLOSE, CLOSE, 12)])
+        self.assertIn("neck_calibrated", tr.baseline)
+        fresh = calibrated_tracker().baseline
+        tr.set_baseline(fresh, posture_logic.default_thresholds(), 100.0)
+        self.assertNotIn("neck_calibrated", tr.baseline)
+        self.assertFalse(tr.seat_moving)
 
 
 class DBTests(unittest.TestCase):

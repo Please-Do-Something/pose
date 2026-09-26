@@ -34,6 +34,20 @@ MAX_GAP = 1.0                  # 판정 프레임 사이 공백이 이보다 길
 HOLD_DISPLAY_DELAY = 1.0       # 판정 보류가 이 시간 넘게 이어질 때만 "판정 보류" 문구를 띄움
 ABSENCE_END_SECONDS = 5.0      # 판정 보류가 이만큼 이어지면(자리를 비움 등) 확정된 이상 자세를 끝난 것으로 처리
 
+# ---- 앉은 거리 변화 자동 보정 ----
+# 의자를 당기거나 빼면 원근 때문에 바른 자세여도 목 길이비가 바뀐다(귀와 어깨의 깊이 차, 카메라 높이 탓).
+# 원근 계수는 카메라/체형마다 달라 미리 알 수 없으므로, 자리를 옮기는 "순간"을 잡아 그 직전·직후의
+# 목 길이비 비율만큼 거북목 기준을 옮긴다. 실제로 생긴 차이를 그대로 쓰므로 카메라별 조정이 필요 없다.
+# 어깨너비가 짧은 시간에 크게 변하면 자리를 옮긴 것으로 본다. 상체만 숙이는 동작은 어깨너비 변화가 작고
+# (카메라 모델: 어깨 5cm + 머리 10cm 앞으로 → +7%), 천천히 무너지는 자세는 창 안에서 변화가 작아 걸리지 않는다.
+SEAT_MOVE_WIDTH_CHANGE = 0.10  # 어깨너비가 SEAT_MOVE_WINDOW 안에 이 비율 이상 변하면 이동 시작 (약 7cm 이상 이동)
+SEAT_MOVE_WINDOW = 3.0         # 이동 감지 비교 구간 [초]
+SEAT_SETTLE_TOLERANCE = 0.02   # 어깨너비가 SEAT_SETTLE_SECONDS 동안 이 비율 안에서 머물면 자리를 잡은 것으로 봄
+SEAT_SETTLE_SECONDS = 1.5
+SEAT_MOVE_TIMEOUT = 10.0       # 이동 시작 후 이 시간 안에 자리를 잡지 않으면 보정 취소
+MAX_SEAT_SHIFT = 0.20          # 한 번 이동으로 옮길 수 있는 거북목 기준 폭 (넘으면 자세도 바뀐 것으로 보고 보정 안 함)
+MAX_TOTAL_SEAT_SHIFT = 0.30    # 캘리브레이션 때 잡은 기준에서 누적으로 옮길 수 있는 폭
+
 # ---- 알림 ----
 NOTIFY_COOLDOWN = 60.0         # 같은 항목은 이 시간 안에 다시 확정돼도 알리지 않음 (자세를 고쳤다 다시 무너질 때 알림 폭주 방지)
 RENOTIFY_SECONDS = 300.0       # 이상 자세가 이어지면 이 간격으로 다시 알림
@@ -165,6 +179,13 @@ class PostureTracker:
         self._last_judged = None
         self._hold_since = None
         self._time = {}  # (날짜, 시) → {"monitored", "bad", 항목별 초}
+        self._seat_hist = deque()  # (시각, 어깨너비, 목 길이비, 거북목 점수) 최근 판정 프레임
+        self._seat_move = None     # 자리 이동 중이면 {"start": 시각, "pre": 이동 직전 샘플 또는 None}
+
+    @property
+    def seat_moving(self):
+        """자리를 옮기는 중이라 거북목 판정을 멈춘 상태인지 (디버그 표시용)."""
+        return self._seat_move is not None
 
     # ---- 상태 조회 ----
     def confirmed_issues(self):
@@ -175,6 +196,8 @@ class PostureTracker:
         events = self.end_all(now)
         self.baseline, self.thresholds = baseline, thresholds
         self.smoother.reset()
+        self._seat_hist.clear()
+        self._seat_move = None
         return events
 
     def end_all(self, now):
@@ -198,7 +221,8 @@ class PostureTracker:
         m: measurement_from_points 결과(사람이 없으면 None).
         반환: {"hold": 보류 사유|None, "hold_shown": 사용자에게 보일 보류 사유|None,
                "sm": 평활값|None, "eval": evaluate_posture 결과|None,
-               "events": [{"type": "start"/"end", "issue", "t", "metric"?}], "notify": [항목]}
+               "events": [{"type": "start"/"end", "issue", "t", "metric"?}], "notify": [항목],
+               "seat_shift": 이번 프레임에 자리 이동을 반영해 거북목 기준을 옮겼으면 {"shift", "width_change"}}
         """
         hold = None
         if m is None:
@@ -208,7 +232,8 @@ class PostureTracker:
         elif not m["shoulder_visible"]:
             hold = "어깨 인식 불안정"
 
-        result = {"hold": hold, "hold_shown": None, "sm": None, "eval": None, "events": [], "notify": []}
+        result = {"hold": hold, "hold_shown": None, "sm": None, "eval": None, "events": [], "notify": [],
+                  "seat_shift": None}
         if self.baseline is None:
             return result  # 기준 자세 설정 전에는 판정/기록/알림을 하지 않는다
 
@@ -230,9 +255,15 @@ class PostureTracker:
         )
         result["sm"], result["eval"] = sm, ev
 
+        result["seat_shift"] = self._track_seat(now, ev)
+
         metric = {"turtle": ev["neck_ratio"], "lean": ev["shoulder_width"],
                   "tilt": ev["tilt_ratio"]}
         for issue in ISSUES:
+            if issue == "turtle" and self._seat_move is not None:
+                # 자리를 옮기는 동안의 목 길이비 변화는 원근 탓이라 거북목 판정을 멈춘다.
+                # (모니터 근접은 가까이 앉은 것 자체가 판정 대상이라 계속 본다)
+                continue
             state = self.states[issue]
             change = state.update(now, ev["scores"][issue])
             if change == "start":
@@ -249,6 +280,53 @@ class PostureTracker:
 
         self._account_time(now)
         return result
+
+    def _track_seat(self, now, ev):
+        """
+        앉은 거리가 바뀌는 순간을 감지하고, 자리를 잡으면 거북목 기준을 옮긴다.
+        기준을 옮겼으면 {"shift": 목 길이비 변화율, "width_change": 어깨너비 변화율}, 아니면 None.
+        """
+        hist = self._seat_hist
+        if hist and now - hist[-1][0] > MAX_GAP:
+            hist.clear()  # 판정이 끊겼으면 전후 비교가 의미 없다
+        hist.append((now, ev["shoulder_width"], ev["neck_ratio"], ev["scores"]["turtle"]))
+        while hist[0][0] < now - SEAT_MOVE_WINDOW:
+            hist.popleft()
+        width = ev["shoulder_width"]
+
+        if self._seat_move is None:
+            oldest = hist[0]
+            if abs(width / oldest[1] - 1) < SEAT_MOVE_WIDTH_CHANGE:
+                return None
+            # 이동 직전이 정상 자세였을 때만 기준을 옮긴다 (거북목 상태로 옮기면 그 자세가 기준에 흡수됨)
+            _, _, pre_neck, pre_score = oldest
+            usable = (pre_neck is not None and pre_score is not None and pre_score < EXIT_SCORE
+                      and not self.states["turtle"].confirmed)
+            self._seat_move = {"start": now, "pre": oldest if usable else None}
+            self.states["turtle"].clear_window()
+            return None
+
+        move = self._seat_move
+        if now - move["start"] > SEAT_MOVE_TIMEOUT:
+            self._seat_move = None  # 계속 움직이면 보정하지 않고 판정을 재개
+            return None
+        settled = [h[1] for h in hist if h[0] >= now - SEAT_SETTLE_SECONDS]
+        if hist[0][0] > now - SEAT_SETTLE_SECONDS or max(settled) / min(settled) - 1 > SEAT_SETTLE_TOLERANCE:
+            return None
+
+        # 자리를 잡았다: 비교 기록을 새로 시작해 이동 구간과 다시 비교되지 않게 한다
+        self._seat_move = None
+        hist.clear()
+        pre, neck = move["pre"], ev["neck_ratio"]
+        if pre is None or neck is None or not self.baseline.get("neck"):
+            return None
+        shift = neck / pre[2]
+        calibrated = self.baseline.get("neck_calibrated", self.baseline["neck"])
+        new_neck = self.baseline["neck"] * shift
+        if abs(shift - 1) > MAX_SEAT_SHIFT or abs(new_neck / calibrated - 1) > MAX_TOTAL_SEAT_SHIFT:
+            return None
+        self.baseline = {**self.baseline, "neck": new_neck, "neck_calibrated": calibrated}
+        return {"shift": shift - 1, "width_change": width / pre[1] - 1}
 
     def _account_time(self, now):
         """판정한 시간과 그중 이상 자세로 확정돼 있던 시간을 시간대별로 쌓는다 (보류 구간은 빼고)."""
